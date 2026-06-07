@@ -55,11 +55,3 @@ def write_lance_frames(
     return lance_path
 
 
-# ---------------------------------------------------------------------------
-# (lerp 函数已移至 down_sample.py)
-# 此文件仅保留 Lance 读写功能
-# ---------------------------------------------------------------------------
-
-
-# 向后兼容：从 down_sample 重新导出 lerp_snapshots
-from down_sample import lerp_snapshots  # noqa: F401

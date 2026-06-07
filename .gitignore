@@ -5,3 +5,6 @@ __pycache__/
 *.swo
 *~
 .DS_Store
+
+# backup dir — archived test files and analysis docs
+backup/
