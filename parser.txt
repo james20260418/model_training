@@ -1,0 +1,1197 @@
+from typing import Dict
+import numpy as np
+import json
+import csv
+import os
+from pathlib import Path
+import re
+import pickle
+import yaml
+from tqdm import tqdm
+
+# from utils.pkl_sampling_vis import Visualizer
+from utils.vis_main import Visualizer
+from utils.data_check_statistics import data_check_statistics_scenario
+from tools.package_lance import PncLancePackage
+from utils.coordinates_v8 import CoordsConverter
+from concurrent.futures import as_completed
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
+import logging
+import gc
+import traceback
+from packaging import version
+import copy
+from ai_infra_tools_pnc.ai_infra_tools_sample import get_data_fetcher
+import shutil
+from openpyxl import load_workbook
+
+logging.basicConfig(level=logging.INFO)
+current_method = multiprocessing.get_start_method(allow_none=True)
+if current_method != "spawn":
+    try:
+        # 使用 force=True 强制设置
+        multiprocessing.set_start_method("spawn", force=True)
+        print(f"已将进程启动方式从 {current_method} 改为 spawn")
+    except RuntimeError as e:
+        print(f"无法设置进程启动方式: {e}")
+else:
+    print("进程启动方式已经是 spawn")
+
+
+class LanceParser:
+    first_run = True
+    count = 0
+
+    def __init__(self, common_cfg: Dict) -> None:
+        self.common_cfg = common_cfg
+        self.online_mode = common_cfg["online_mode"]
+        self.save_sample = common_cfg["save_sample"]
+        self.sample_period = common_cfg["sample_period"]
+        self.STORAGE_OPTIONS = {
+            # "access_key_id": '82988b882a051689',
+            # "secret_access_key": '181b7620907e4cedba39d260dbdf3c38',
+            "access_key_id": "a0e68a8677a30592",
+            "secret_access_key": "e618295083d7414882b94ebccd267390",
+            "endpoint": "http://cafs.sda.changan.com.cn",
+        }
+
+        self._storage_options_cache = {}
+        self.prediction_scenario = [
+            "ramp-cutin",
+            "cruise-no cutin",
+            "cruise-cutin",
+            "intersection-ego-straight",
+            "intersection-ego-left",
+            "intersection-ego-right",
+            "intersection-ego-uturn",
+            "follow-car",
+            "intersection-before",
+        ]
+        self.planning_scenario = [
+            "ramp-cutin",
+            "cruise-no cutin",
+            "cruise-cutin",
+            "intersection-ego-straight",
+            "intersection-ego-left",
+            "intersection-ego-right",
+            "intersection-ego-uturn",
+            "follow-car-stop",
+            "follow-car-start",
+            "bypass",
+            "intersection-before",
+        ]
+        self.ref_path_test = [
+            "intersection-ego-straight",
+            "intersection-ego-left",
+            "intersection-ego-right",
+            "intersection-ego-uturn",
+            "intersection-before",
+        ]
+
+        self.save_path = "/tmp/algorithm/output"
+        self.max_workers = common_cfg["max_workers"]
+        self.converter = CoordsConverter()
+        self.cur_frame = -1 if self.online_mode else common_cfg["cur_frame"]
+        if self.common_cfg["algrithms_switch"]["qcnet"]:
+            from algorithms.qcnet.qcnet_parser import QCNetParser
+
+            with open("configs/qcnet.yml", "r", encoding="utf-8") as f:
+                qcnet_cfg = yaml.safe_load(f)
+
+                if self.common_cfg["use_dag"]:
+                    qcnet_cfg["save_path"] = "/mnt/result"
+
+                self.qcnet_parser = QCNetParser(common_cfg, qcnet_cfg)
+                self.save_path = qcnet_cfg["save_path"]
+        self.shared_state = None
+
+    def _init_shared_state(self):
+        """初始化多进程共享状态"""
+        # 使用 Manager 创建进程间共享的字典
+        manager = multiprocessing.Manager()
+        self.shared_state = manager.dict()
+        self.shared_state["first_run"] = True
+        self.shared_state["count"] = 0
+        self.shared_state_lock = manager.Lock()
+
+    def get_shared_first_run(self):
+        """获取共享的 first_run 状态"""
+        if self.shared_state:
+            with self.shared_state_lock:
+                return self.shared_state["first_run"]
+        return True  # 单进程模式默认返回 True
+
+    def set_shared_first_run(self, value):
+        """设置共享的 first_run 状态"""
+        if self.shared_state:
+            with self.shared_state_lock:
+                self.shared_state["first_run"] = value
+
+    def increment_shared_count(self):
+        """原子递增共享计数器"""
+        if self.shared_state:
+            with self.shared_state_lock:
+                self.shared_state["count"] += 1
+                return self.shared_state["count"]
+        return 0
+
+    def get_storage_options_by_path(self, path: str) -> Dict:
+        """根据路径前缀返回对应的存储配置"""
+        for prefix, options in self._storage_options_by_prefix.items():
+            if path.startswith(prefix):
+                return options
+
+        # 如果都不匹配，返回默认配置
+        return self.STORAGE_OPTIONS
+
+    def all_values_empty(self, dictionary, empty_values=None):
+        values_len = 0
+        for value in dictionary.values():
+            values_len += len(value)
+        if values_len == 0:
+            return True
+        else:
+            return False
+
+    def check_simple_msg(self, simple, scenario, index):
+        if simple is None:
+            scenario["data_check"][index]["src_label_stag_1"] = "None"
+            return False
+        scenario["data_check"][index]["timestamp"] = simple["timestamp"]
+        scenario["data_check"][index]["src_label_stag_1"] = "Valid"
+        # 检查数据中有没有想要的字段
+        extract_msg = ["dat_name", "ego", "agents", "algo_env", "timestamp", "sd_map"]
+        find_msg_success = True
+        for msg_key in extract_msg:
+            if msg_key not in simple:
+                scenario["data_check"][index][msg_key] = "Not Exist"
+                print("lance has not {}", msg_key)
+                find_msg_success = False
+
+        if "algo_env" in simple and not simple["algo_env"]["lanes"]:
+            if not scenario["data_check"][index].get("algo_env", None):
+                scenario["data_check"][index]["algo_env"] = {}
+            scenario["data_check"][index]["algo_env"]["lanes"] = "Not Exist"
+            find_msg_success = False
+
+        return find_msg_success
+
+    def check_ego_states(self, ego_data, scenario, index):
+        if (
+            ego_data["ego_states"][40][0] == 0.0
+            and ego_data["ego_states"][40][1] == 0.0
+        ):
+            scenario["data_check"][index]["ego_states"] = "Valid"
+        else:
+            scenario["data_check"][index]["ego_states"] = "Not Valid"
+
+    def check_map_valid(self, simple, scenario, index, extracted_version):
+        bev_info = simple["algo_env"]
+        bev_msg = ["position", "lanes", "lines", "boundaries", "junctions"]
+        scenario["data_check"][index]["algo_env"] = {}
+        for msg_key in bev_msg:
+            if msg_key not in bev_info:
+                scenario["data_check"][index]["algo_env"][msg_key] = "Not Exist"
+            else:
+                if (
+                    bev_info[msg_key] is None
+                    or (
+                        isinstance(bev_info[msg_key], list)
+                        or isinstance(bev_info[msg_key], dict)
+                    )
+                    and len(bev_info[msg_key]) == 0
+                ):
+                    scenario["data_check"][index]["algo_env"][msg_key] = "None"
+                else:
+                    # 如果是假bev数据，需要打上标签
+                    if msg_key == "position":
+                        scenario["data_check"][index]["algo_env_from_bev"] = False
+                        position = bev_info["position"]["pose"]["position"]
+                        if position["x"] != 0 or position["y"] != 0:
+                            scenario["data_check"][index]["algo_env_from_bev"] = True
+
+                    if msg_key == "junctions":
+                        if (
+                            "pts" in bev_info[msg_key][0]
+                            and len(bev_info[msg_key][0]["pts"]) > 0
+                        ):
+                            scenario["data_check"][index]["algo_env"][
+                                "junction_pts"
+                            ] = "Exist"
+                            if bev_info[msg_key][0]["pts"][0]["z"] > 0:
+                                scenario["data_check"][index]["algo_env"][
+                                    "junction_pts"
+                                ] = "Valid"
+                        if (
+                            "junction_pts" in bev_info[msg_key][0]
+                            and len(bev_info[msg_key][0]["junction_pts"]) > 0
+                        ):
+                            scenario["data_check"][index]["algo_env"][
+                                "junction_pts"
+                            ] = "Exist"
+                            if (
+                                bev_info[msg_key][0]["junction_pts"][0]["point"]["z"]
+                                > 0
+                                or bev_info[msg_key][0]["junction_pts"][0]["type"]
+                                == "kJPTExit"
+                                or bev_info[msg_key][0]["junction_pts"][0]["type"]
+                                == "kJPTEntrance"
+                            ):
+                                scenario["data_check"][index]["algo_env"][
+                                    "junction_pts"
+                                ] = "Valid"
+                    scenario["data_check"][index]["algo_env"][msg_key] = "Valid"
+
+        sd_map = simple["sd_map"]
+        if "path_info" not in sd_map:
+            scenario["data_check"][index]["path_info"] = "Not Exist"
+        else:
+            if (
+                sd_map["path_info"] is None
+                or (
+                    isinstance(sd_map["path_info"], list)
+                    or isinstance(sd_map["path_info"], dict)
+                )
+                and len(sd_map["path_info"]) == 0
+            ):
+                scenario["data_check"][index]["path_info"] = "None"
+            elif version.parse(extracted_version) >= version.parse("2.4.1"):
+                if (
+                    "segments" in sd_map["path_info"]
+                    and len(sd_map["path_info"]["segments"]) == 0
+                ):
+                    scenario["data_check"][index]["path_info"] = "None"
+                else:
+                    scenario["data_check"][index]["path_info"] = "Valid"
+            else:
+                if (
+                    "segments" in sd_map["path_info"][0]
+                    and len(sd_map["path_info"][0]["segments"]) == 0
+                ):
+                    scenario["data_check"][index]["path_info"] = "None"
+                else:
+                    scenario["data_check"][index]["path_info"] = "Valid"
+
+        map_data = simple["map"]
+        scenario["data_check"][index]["map"] = {}
+        map_msg = ["links", "car_links"]
+        for msg_key in map_msg:
+            if msg_key not in map_data:
+                scenario["data_check"][index]["map"][msg_key] = "Not Exist"
+            else:
+                if (
+                    map_data[msg_key] is None
+                    or (
+                        isinstance(map_data[msg_key], list)
+                        or isinstance(map_data[msg_key], dict)
+                    )
+                    and len(map_data[msg_key]) == 0
+                ):
+                    scenario["data_check"][index]["map"][msg_key] = "None"
+                else:
+                    scenario["data_check"][index]["map"][msg_key] = "Valid"
+
+        if "route_links" not in simple:
+            scenario["data_check"][index]["map"]["route_links"] = "Not Exist"
+        else:
+            if (
+                simple["route_links"] is None
+                or (
+                    isinstance(simple["route_links"], list)
+                    or isinstance(simple["route_links"], dict)
+                )
+                and len(simple["route_links"]) == 0
+            ):
+                scenario["data_check"][index]["map"]["route_links"] = "None"
+            else:
+                scenario["data_check"][index]["map"]["route_links"] = "Valid"
+
+        if "intersection_roads" not in map_data:
+            if "intersections" in map_data:
+                if (
+                    map_data["intersections"] is None
+                    or (
+                        isinstance(map_data["intersections"], list)
+                        or isinstance(map_data["intersections"], dict)
+                    )
+                    and len(map_data["intersections"]) == 0
+                ):
+                    scenario["data_check"][index]["map"]["intersection_roads"] = "None"
+                else:
+                    scenario["data_check"][index]["map"]["intersection_roads"] = "Valid"
+            else:
+                scenario["data_check"][index]["map"]["intersection_roads"] = "Not Exist"
+        else:
+            if (
+                map_data["intersection_roads"] is None
+                or (
+                    isinstance(map_data["intersection_roads"], list)
+                    or isinstance(map_data["intersection_roads"], dict)
+                )
+                and len(map_data["intersection_roads"]) == 0
+            ):
+                scenario["data_check"][index]["map"]["intersection_roads"] = "None"
+            else:
+                scenario["data_check"][index]["map"]["intersection_roads"] = "Valid"
+
+    def check_dataout_tags(self, data_out, scenario):
+        scenario["pkl_valid"] = data_out["pkl_valid"]
+        scenario["will_predict_path"] = data_out["Flags"]["will_predict_path"].item()
+        scenario["gt_refpath_centerline_valid"] = (
+            data_out["gt_refpath"]["centerline_valid_mask"].any().item()
+        )
+        scenario["sdmap_unmatched_gt"] = data_out["Flags"]["sdmap_unmatched_gt"].item()
+        scenario["agent_predict_mask_any"] = (
+            data_out["agent"]["predict_mask"].any().item()
+        )
+        scenario["agent_valid_mask_any"] = data_out["agent"]["valid_mask"].any().item()
+        av_index = data_out.get("agent").get("av_index")
+        scenario["ego_spd_kph"] = (
+            np.linalg.norm(data_out["agent"]["velocity"][av_index][self.cur_frame])
+            * 3.6
+        )
+
+        if "boundary_loss_valid" in data_out["Flags"]:
+            scenario["boundary_loss_valid"] = data_out["Flags"]["boundary_loss_valid"]
+
+        if self.all_values_empty(data_out["sdmap_path"]["refpaths_local"][0]):
+            scenario["sdmap_path_refpaths_local"] = "Not Valid"
+        else:
+            scenario["sdmap_path_refpaths_local"] = "Valid"
+        if data_out["cross_info"]["in_cross"]:
+            scenario["in_cross"] = "Valid"
+        else:
+            scenario["in_cross"] = "Not Valid"
+
+        scenario["ego_lanechange"] = data_out["Flags"]["ego_lanechange"]
+        scenario["action_type"] = data_out["extra_tag"]["action_type"]
+        scenario["gt_extra_tag"] = data_out["extra_tag"]["gt_extra_tag"]
+
+        # 获取tag
+        tags_msg = {
+            "lanechange_tag": "lanechange_agent_id",
+            "cutin_tag": "cutin_tag_agent_id",
+            "merge_tag": "merge_tag_agent_id",
+            "cross_tag": "cross_tag_agent_id",
+        }
+        scenario.setdefault("tags_msg", {})
+        scenario["tags_msg"]["all_agents_id"] = data_out["agent"]["id"].tolist()
+        scenario["tags_msg"]["predict_valid_agents_id"] = []
+        for agent_idx, agent_predict_mask in enumerate(
+            data_out["agent"]["predict_mask"]
+        ):
+            if agent_predict_mask.any():
+                scenario["tags_msg"]["predict_valid_agents_id"].append(
+                    data_out["agent"]["id"][agent_idx].item()
+                )
+        for tag, agent_ids in tags_msg.items():
+            scenario["tags_msg"].setdefault(agent_ids, [])
+            if tag in data_out["agent"]["tags"]:
+                indices = np.where(data_out["agent"]["tags"][tag].numpy() == 1)
+                if len(indices) > 0:
+                    scenario["tags_msg"][agent_ids] = data_out["agent"]["id"][
+                        indices
+                    ].tolist()
+
+        scenario["refpath_task_valid"] = data_out["task_valid"]["refpath_task_valid"]
+        scenario["planning_task_valid"] = data_out["task_valid"]["planning_task_valid"]
+        scenario["prediction_task_valid"] = data_out["task_valid"][
+            "prediction_task_valid"
+        ]
+        scenario["is_nudge_scenario"] = data_out["Flags"]["is_nudge_scenario"].item()
+
+    def load_lance(
+        self,
+        data_fetcher,
+        dat_name,
+        code_version,
+        lance_stage_one_path,
+        lance_sensor_path,
+        frames,
+        pkl_parser=True,
+        lance_parser=True,
+        scenario: dict = {},
+        is_test_data=True,
+    ) -> list:
+        print(f"processing {dat_name}, valid frame number = {len(frames)}")
+        images_byte = {
+            "ac_front_wide_byte": bytes,
+            "ac_front_narr_byte": bytes,
+            "ac_back_right_byte": bytes,
+            "ac_front_right_byte": bytes,
+            "ac_front_left_byte": bytes,
+            "ac_back_left_byte": bytes,
+            "ac_back_byte": bytes,
+        }
+
+        frame_dict = {"dat_name": [], "frame_key": [], "pnc_simple": []}
+
+        try:
+            match = re.search(r"v?(\d+\.\d+\.\d+)", code_version)
+            if not match:
+                raise ValueError(f"无法从 {code_version} 中提取版本号")
+            extracted_version = match.group(1)
+
+            row_count = len(frames)
+            sample_step = int(round(self.sample_period / 0.1))
+            scenario["rows_num"] = row_count
+            scenario["valid_rows_num"] = int(round(row_count / sample_step))
+
+            all_ego_status = {}
+            stoplineinfo_in_dat = {}
+            sdmap_pathinfo_in_dat = {}
+            if version.parse(extracted_version) < version.parse("2.4.1"):
+                (
+                    all_ego_status,
+                    stoplineinfo_in_dat,
+                    sdmap_pathinfo_in_dat,
+                ) = self.extra_all_frame_info(
+                    data_fetcher,
+                    dat_name,
+                    lance_stage_one_path,
+                    frames,
+                )
+            lance_stage_one_infos = [(lance_stage_one_path, ["src_label_stag_1"])]
+
+            for frame, frame_ids in list(frames.items())[::sample_step]:
+                try:
+                    frame_data_list = data_fetcher.fetch_frame_data(
+                        dat_name, frame, lance_stage_one_infos
+                    )
+                except Exception as e:
+                    print(
+                        f"{e}, lance_infos:{lance_stage_one_infos}, dat_name: {dat_name}, frame_id: {frame}"
+                    )
+                simple = pickle.loads(frame_data_list[0])
+                index = frame_ids["row_id"]
+                scenario["data_check"][index] = {}
+
+                if not self.check_simple_msg(simple, scenario, index):
+                    continue
+                k2 = frame_ids.get("sensor_row_id", -1)
+                if k2 == -1:
+                    continue
+                if k2 > 0:
+                    if index in scenario["data_check"]:
+                        scenario["data_check"][index]["sensor_row_id"] = k2
+                frame_key = f"{dat_name}_{frame}"
+
+                if is_test_data:
+                    lance_sensor_infos = [(lance_sensor_path, ["sensor"])]
+                    try:
+                        sensor_frame_list = data_fetcher.fetch_frame_data(
+                            dat_name, frame, lance_sensor_infos
+                        )
+                    except Exception as e:
+                        print(
+                            f"{e}, lance_infos:{lance_sensor_infos}, dat_name: {dat_name}, frame_id: {frame}"
+                        )
+                    sensor_data = pickle.loads(sensor_frame_list[0])
+                    images_byte["ac_front_wide_byte"] = (
+                        sensor_data.get("ac_front_wide")
+                        if "ac_front_wide" in sensor_data
+                        else sensor_data.get("cam_front")
+                    )
+                    images_byte["ac_back_byte"] = (
+                        sensor_data.get("ac_back")
+                        if "ac_back" in sensor_data
+                        else sensor_data.get("cam_rear")
+                    )
+                    images_byte["ac_front_left_byte"] = (
+                        sensor_data.get("ac_front_left")
+                        if "ac_front_left" in sensor_data
+                        else sensor_data.get("cam_front_left")
+                    )
+                    images_byte["ac_front_right_byte"] = (
+                        sensor_data.get("ac_front_right")
+                        if "ac_front_right" in sensor_data
+                        else sensor_data.get("cam_front_right")
+                    )
+                    images_byte["ac_back_left_byte"] = (
+                        sensor_data.get("ac_back_left")
+                        if "ac_back_left" in sensor_data
+                        else sensor_data.get("cam_rear_left")
+                    )
+                    images_byte["ac_back_right_byte"] = (
+                        sensor_data.get("ac_back_right")
+                        if "ac_back_right" in sensor_data
+                        else sensor_data.get("cam_rear_right")
+                    )
+
+                file_name = simple["dat_name"]
+                ego_data = simple["ego"]
+                agent_data = simple["agents"]
+                bev_info = simple["algo_env"]
+                timestamp = simple["timestamp"]
+                sd_map = simple["sd_map"]
+                map_data = simple["map"]
+
+                self.check_map_valid(simple, scenario, index, extracted_version)
+                if (
+                    scenario["data_check"][index]["path_info"] != "Valid"
+                    and len(sdmap_pathinfo_in_dat) > 0
+                ):
+                    closest_key = min(
+                        list(sdmap_pathinfo_in_dat.keys()), key=lambda k: abs(k - index)
+                    )
+                    sd_map["path_info"] = sdmap_pathinfo_in_dat[closest_key]
+                sd_map_fulldata = {}
+
+                if version.parse(extracted_version) >= version.parse("2.4.1"):
+                    sd_map_fulldata["path_info"] = simple["sd_map_full_data"].get(
+                        "path_info", {}
+                    )
+                else:
+                    sd_map_fulldata["path_info"] = {}
+                stopline_list = []
+                if len(stoplineinfo_in_dat) > 0 and index not in stoplineinfo_in_dat:
+                    closest_key = min(
+                        list(stoplineinfo_in_dat.keys()), key=lambda k: abs(k - index)
+                    )
+                    stopline_list = stoplineinfo_in_dat[closest_key]
+                data_input = {}
+                data_input["stopline_list"] = stopline_list
+                data_input["flow_ego_trafficlight_vec"] = (
+                    map_data["flow_ego_trafficlight_vectors"]
+                    if "flow_ego_trafficlight_vectors" in map_data
+                    else []
+                )
+                data_input["flow_ego_trafficlight_future_vec"] = (
+                    map_data["flow_ego_trafficlight_future_vectors"]
+                    if "flow_ego_trafficlight_future_vectors" in map_data
+                    else []
+                )
+                data_input["links"] = map_data["links"]
+
+                if self.common_cfg["algrithms_switch"]["qcnet"]:
+                    try:
+                        data_out = self.qcnet_parser.enum_single(
+                            file_name,
+                            images_byte,
+                            ego_data,
+                            agent_data,
+                            all_ego_status,
+                            bev_info,
+                            sd_map,
+                            sd_map_fulldata,
+                            extracted_version,
+                            data_input,
+                            timestamp,
+                            scenario,
+                            save_sample=True,
+                        )
+                        self.check_dataout_tags(data_out, scenario["data_check"][index])
+                        if lance_parser:
+                            self.package_pkls(
+                                data_out,
+                                frame_key,
+                                file_name,
+                                frame_dict,
+                                scenario["data_check"][index],
+                            )
+                        del data_out
+                    except Exception as e:
+                        print("qcnet enum single error: {}".format(e))
+                        print(f"error file {frame_key}")
+                        traceback.print_exc()
+
+            gc.collect()  # 强制回收内存
+            return True, frame_dict
+        except Exception as e:
+            print("lance parser failed: {}".format(e))
+            traceback.print_exc()
+            return False, frame_dict
+
+    def package_pkls(self, data_out, frame_key, dat_name, frame_dict, scenario):
+        if data_out is None or len(data_out) < 1 or not data_out["pkl_valid"]:
+            # simple = {}
+            return
+        else:
+            simple = data_out
+        value = pickle.dumps(simple)
+
+        scenario["pnc_row_id"] = len(frame_dict["frame_key"])
+
+        frame_dict["dat_name"].append(dat_name)
+        frame_dict["frame_key"].append(frame_key)
+        frame_dict["pnc_simple"].append(value)
+
+    def extra_all_frame_info(
+        self, data_fetcher, dat_name, lance_stage_one_path, frames
+    ):
+        """
+        提前提取所有帧的关键信息：ego状态、SDMap路径信息、停止线信息
+        """
+        all_ego_status = {}
+        stoplineinfo_in_dat = {}
+        sdmap_pathinfo_in_dat = {}
+
+        lance_infos = [(lance_stage_one_path, ["src_label_stag_1"])]
+
+        for frame, frame_ids in list(frames.items()):
+            tmp_index = frame_ids["row_id"]
+            try:
+                frame_data_list = data_fetcher.fetch_frame_data(
+                    dat_name, frame, lance_infos
+                )
+            except Exception as e:
+                print(
+                    f"{e}, lance_infos:{lance_infos}, dat_name: {dat_name}, frame_id: {frame}"
+                )
+            try:
+                simple = pickle.loads(frame_data_list[0])
+                if not isinstance(simple, dict):
+                    continue
+
+                # 提取基础字段
+                required_keys = [
+                    "dat_name",
+                    "ego",
+                    "agents",
+                    "algo_env",
+                    "timestamp",
+                    "sd_map",
+                ]
+                if not all(k in simple for k in required_keys):
+                    continue
+
+                # 1. 提取 ego 状态
+                self.get_ego_future(simple, all_ego_status)
+
+                # 2. 提取 SDMap 路径信息
+                self.get_sdmap_pathinfo(
+                    simple,
+                    tmp_index,
+                    sdmap_pathinfo_in_dat,
+                )
+
+                # 3. 提取停止线信息
+                self.get_stopline_info(simple, tmp_index, stoplineinfo_in_dat)
+
+            except Exception as e:
+                print(f"解析 frame 失败 index={tmp_index}: {e}")
+                continue
+
+        return (
+            all_ego_status,
+            stoplineinfo_in_dat,
+            sdmap_pathinfo_in_dat,
+        )
+
+    def get_ego_future(self, simple, all_ego_status):
+        """提取 ego 未来状态"""
+        timestamp = simple["timestamp"]
+        ego_data = simple["ego"]
+        all_ego_status[timestamp] = ego_data
+
+    def get_sdmap_pathinfo(
+        self,
+        simple,
+        tmp_index: int,
+        sdmap_pathinfo_in_dat: dict,
+    ):
+        """提取 SDMap 路径信息"""
+        if "sd_map" in simple:
+            path_info = simple["sd_map"].get("path_info")
+            if path_info and self._is_valid_path_info(path_info):
+                sdmap_pathinfo_in_dat[tmp_index] = path_info
+
+    def _is_valid_path_info(self, path_info) -> bool:
+        """检查 path_info 是否有效"""
+        return (
+            isinstance(path_info, (list, dict))
+            and len(path_info) > 0
+            and any(
+                "segments" in item
+                for item in (path_info if isinstance(path_info, list) else [path_info])
+            )
+        )
+
+    def get_stopline_info(self, simple, tmp_index: int, stoplineinfo_in_dat: dict):
+        """提取停止线信息"""
+        ground_markings = simple.get("algo_env", {}).get("ground_markings", [])
+        if not ground_markings:
+            return
+        ego_data = simple["ego"]
+        ego_pos_global = np.array([[ego_data["pos_enu"][0], ego_data["pos_enu"][1]]])
+        ego_yaw = (
+            ego_data["heading_angle_global"]
+            if ego_data["heading_angle_global"] < 180
+            else ego_data["heading_angle_global"] - 360
+        )
+        ego_heading_global = np.deg2rad(ego_yaw)
+
+        stopline_list = []
+        for mark in ground_markings:
+            if mark.get("ground_mark_type") != "kGMTStopLine":
+                continue
+            # 中心点转换
+            pos_vcs = [mark["position"]["x"], mark["position"]["y"]]
+            pos_enu = self.converter.ego2utm(
+                [pos_vcs], ego_pos_global, ego_heading_global
+            )[0]
+
+            # 所有点转换
+            pts_vcs = [[pt["x"], pt["y"]] for pt in mark.get("pts", [])]
+            pts_enu = (
+                self.converter.ego2utm(
+                    pts_vcs, ego_pos_global, ego_heading_global
+                ).tolist()
+                if pts_vcs
+                else []
+            )
+
+            stopline_list.append(
+                {
+                    "stopline_center_points": {"vcs": pos_vcs, "enu": pos_enu},
+                    "stopline_points": {"vcs": pts_vcs, "enu": pts_enu},
+                }
+            )
+
+        if stopline_list:
+            stoplineinfo_in_dat[tmp_index] = stopline_list
+
+    def _extract_scenario_name_from_filename(self, filename: str) -> str:
+        """从文件名中提取场景名称 - 取到第一个连续数字前的所有内容"""
+        # 移除扩展名
+        basename = os.path.splitext(filename)[0]
+
+        # 方案：匹配到第一个纯数字部分（由下划线分隔）
+        match = re.search(r"^(.+?)(?=_\d+$|_\d+_)", basename)
+
+        if match:
+            # 找到匹配，返回场景名
+            scenario_name = match.group(1)
+            print(f"从文件名 '{basename}' 提取场景名: {scenario_name}")
+            return scenario_name
+        else:
+            # 如果没有匹配，尝试匹配到第一个连续数字（不考虑下划线）
+            match2 = re.search(r"^(.+?)(?=\d)", basename)
+            if match2:
+                scenario_name = match2.group(1).rstrip("_")  # 去掉末尾可能的下划线
+                print(f"从文件名 '{basename}' 提取场景名(方案2): {scenario_name}")
+                return scenario_name
+
+        # 如果都没有匹配到，返回整个basename
+        print(f"从文件名 '{basename}' 提取场景名(默认): {basename}")
+        return basename
+
+    def parse_input_from_csv(self, csv_path):
+        """从 CSV 文件解析输入数据"""
+        result_dict = {}
+        with open(csv_path, "r", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            rows = list(reader)
+
+        for row in rows:
+            row = {k: v for k, v in row.items() if v.strip() != ""}
+            dat_name = row["Dat名"]
+            if_version = row["版本号"]
+            infer_type = row["infer_type"]
+            lance_stage_one_dir = row["lance_stage_one"]
+            lance_sensor_dir = row["lance_sensor"]
+            code_version = row.get("code_version", "v2.3.0_cafdea")
+
+            label_path = f"{lance_stage_one_dir}/label.json"
+
+            result_dict[dat_name] = {
+                "Dat名": dat_name,
+                "code_version": code_version,
+                "版本号": if_version,
+                "infer_type": infer_type,
+                "lance_stage_one": lance_stage_one_dir,
+                "lance_sensor": lance_sensor_dir,
+                "lance_stage_one_label": label_path,
+                "frames": {},
+                "scenario": [],  # CSV 无场景信息
+            }
+
+        return result_dict
+
+    def parse_input_from_s3_label_files(self, s3_label_files):
+        """从 S3 下载的 label.json 文件列表中解析数据"""
+        result_dict = {}
+        for label_file in s3_label_files:
+            data_fetcher_local = get_data_fetcher(label_file)
+            _, data = data_fetcher_local.load_label_json(label_file)
+            for dat_name, dat_info in data.items():
+                lance_stage_one_dir = dat_info.get("lance_stage_one_path", "")
+                frames = dat_info.get("frame", {})
+                frame_data = {
+                    k: {"row_id": v["row_id"], "sensor_row_id": v["sensor_row_id"]}
+                    for k, v in frames.items()
+                }
+                result_dict[dat_name] = {
+                    "Dat名": dat_name,
+                    "code_version": dat_info.get("code_version", "v2.3.0_cafdea"),
+                    "版本号": "if54",
+                    "infer_type": "online_light",
+                    "lance_stage_one": lance_stage_one_dir,
+                    "lance_sensor": dat_info.get("lance_sensor_path", ""),
+                    "lance_stage_one_label": f"{lance_stage_one_dir}/label.json",
+                    "frames": frame_data,
+                    "scenario": [],  # S3 未指定场景
+                }
+                if not (result_dict[dat_name]["code_version"]).startswith("v"):
+                    result_dict[dat_name]["code_version"] = "v2.4.1_beta2"
+        # output_df = pd.DataFrame(result_dict).T  # 使用 .T 进行转置，使 dat_name 成为索引
+        # output_df = output_df[["Dat名", "版本号", "code_version", "infer_type", "lance_stage_one", "lance_sensor"]]
+        # output_df.to_csv('/root/tencent/liuyidi/lance-1219/data-dat_to_sample/label.csv', index=False, encoding="utf-8")
+        return result_dict
+
+    def parse_input_from_local_json(self, json_path):
+        """从本地 JSON 配置文件解析输入数据，提取 scenario 名称"""
+        result_dict = {}
+        file_name = Path(json_path).name
+        scenario_name = self._extract_scenario_name_from_filename(file_name)
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        for dat_name, info in data.items():
+            lance_stage_one_dir = info["lance_stage_one_path"]
+            lance_sensor_dir = info["lance_sensor_path"]
+            code_version = info.get("code_version", "v2.3.0_cafdea")
+            frames = info.get("frame", {})
+
+            result_dict[dat_name] = {
+                "Dat名": dat_name,
+                "code_version": code_version,
+                "版本号": "if52",
+                "infer_type": "",
+                "lance_stage_one": lance_stage_one_dir,
+                "lance_sensor": lance_sensor_dir,
+                "lance_stage_one_label": f"{lance_stage_one_dir}/label.json",
+                "frames": frames,
+                "scenario": [scenario_name],
+            }
+        return result_dict
+
+    def parse_input_from_xlsx(self, xlsx_path):
+        """从 XLSX 文件解析输入数据"""
+        result_dict = {}
+        try:
+            # 加载工作簿
+            workbook = load_workbook(xlsx_path)
+            sheet_names = workbook.sheetnames
+
+            # 检查所需工作表是否存在
+            if "clip输出路径" not in sheet_names:
+                raise ValueError("工作表 'clip输出路径' 不存在")
+            if "任务总览" not in sheet_names:
+                raise ValueError("工作表 '任务总览' 不存在")
+            if "运行详情" not in sheet_names:
+                raise ValueError("工作表 '运行详情' 不存在")
+
+            # 读取"任务总览"工作表，以task_id为键建立索引
+            overview_sheet = workbook["任务总览"]
+            overview_headers = [cell.value for cell in next(overview_sheet.iter_rows())]
+            task_overview = {}
+
+            # 确保task_id列存在
+            if "task_id" not in overview_headers:
+                raise ValueError("工作表 '任务总览' 中缺少 'task_id' 列")
+
+            # 提取需要的列的索引
+            required_overview_cols = ["version", "infer_type", "succeed_num"]
+            col_indices = {}
+            for col in required_overview_cols:
+                if col in overview_headers:
+                    col_indices[col] = overview_headers.index(col)
+
+            # 遍历"任务总览"表，建立task_id索引
+            for row in overview_sheet.iter_rows(min_row=2):
+                row_values = [cell.value for cell in row]
+                task_id = row_values[overview_headers.index("task_id")]
+                if task_id and task_id not in task_overview:
+                    task_overview[task_id] = {}
+                    for col, idx in col_indices.items():
+                        if idx < len(row_values):
+                            task_overview[task_id][col] = row_values[idx]
+
+            # 读取"运行详情"工作表，提取if_version信息
+            run_detail_sheet = workbook["运行详情"]
+            run_detail_headers = [
+                cell.value for cell in next(run_detail_sheet.iter_rows())
+            ]
+
+            # 验证所需列是否存在
+            if "task_id" not in run_detail_headers:
+                raise ValueError("工作表 '运行详情' 中缺少 'task_id' 列")
+            if "if_version" not in run_detail_headers:
+                raise ValueError("工作表 '运行详情' 中缺少 'if_version' 列")
+
+            # 提取if_version列的索引
+            task_id_idx = run_detail_headers.index("task_id")
+            if_version_idx = run_detail_headers.index("if_version")
+
+            # 建立task_id到if_version的映射
+            task_if_version = {}
+            for row in run_detail_sheet.iter_rows(min_row=2):
+                row_values = [cell.value for cell in row]
+                if len(row_values) > if_version_idx:
+                    task_id = (
+                        row_values[task_id_idx]
+                        if task_id_idx < len(row_values)
+                        else None
+                    )
+                    if_version = (
+                        row_values[if_version_idx]
+                        if if_version_idx < len(row_values)
+                        else None
+                    )
+                    if task_id:
+                        task_if_version[task_id] = if_version
+
+            # 读取"clip输出路径"工作表
+            clip_sheet = workbook["clip输出路径"]
+            clip_headers = [cell.value for cell in next(clip_sheet.iter_rows())]
+
+            # 验证所需列是否存在
+            required_clip_cols = [
+                "task_id",
+                "clip_name",
+                "LanceSensor",
+                "LanceStageOne",
+            ]
+            for col in required_clip_cols:
+                if col not in clip_headers:
+                    raise ValueError(f"工作表 'clip输出路径' 中缺少 '{col}' 列")
+
+            # 提取需要的列的索引
+            clip_col_indices = {
+                col: clip_headers.index(col) for col in required_clip_cols
+            }
+
+            # 遍历每一行，关联两个工作表的数据
+            for row in clip_sheet.iter_rows(min_row=2):
+                row_values = [cell.value for cell in row]
+
+                # 提取所需列的值
+                task_id = row_values[clip_col_indices["task_id"]]
+                clip_name = row_values[clip_col_indices["clip_name"]]
+                lance_sensor = row_values[clip_col_indices["LanceSensor"]]
+                lance_stage_one = row_values[clip_col_indices["LanceStageOne"]]
+
+                # 跳过空行或无效数据
+                if not task_id:
+                    continue
+
+                # 从"任务总览"中查找对应的数据
+                overview_data = task_overview.get(task_id, {})
+
+                if not overview_data:
+                    # 如果在"任务总览"中找不到对应的task_id，跳过该行
+                    print(
+                        f"Warning: Task ID {task_id} not found in task overview sheet."
+                    )
+                    continue
+                if overview_data.get("succeed_num") == 0:
+                    # 如果该任务的succeed_num为0，跳过该行
+                    print(
+                        f"Warning: Task ID {task_id} has succeed_num = 0, skipping it."
+                    )
+                    continue
+
+                # 获取if_version信息
+                if_version = task_if_version.get(task_id, "v2.4.1")  # 默认值
+
+                result_dict[clip_name] = {
+                    "Dat名": clip_name,
+                    "code_version": overview_data.get("version", "v2.4.1"),
+                    "版本号": if_version,  # 添加if_version信息
+                    "infer_type": overview_data.get("infer_type"),
+                    "lance_stage_one": f"s3:/{lance_stage_one}",
+                    "lance_sensor": f"s3:/{lance_sensor}",
+                    "lance_stage_one_label": f"s3:/{lance_stage_one}/label.json",
+                    "frames": {},
+                    "scenario": [],  # xlsx 无场景信息
+                }
+        except Exception as e:
+            print(f"Error processing xlsx file: {e}")
+            raise e
+
+        return result_dict
+
+    def process_single_dat(self, lance_info, is_test_data, save_path_org, total):
+        count = self.increment_shared_count()
+
+        print(f"start processing {lance_info['Dat名']} count/total: {count}/{total}")
+        try:
+            if not lance_info["frames"]:
+                data_fetcher_local = get_data_fetcher(
+                    lance_info["lance_stage_one_label"]
+                )
+                dat_name = lance_info["Dat名"]
+                _, label_data = data_fetcher_local.load_label_json(
+                    lance_info["lance_stage_one_label"]
+                )
+                frames = label_data[dat_name].get("frame", {})
+                frame_data = {
+                    k: {"row_id": v["row_id"], "sensor_row_id": v["sensor_row_id"]}
+                    for k, v in frames.items()
+                }
+                lance_info["frames"] = frame_data
+            data_check_dict_local = copy.deepcopy(lance_info)
+            del data_check_dict_local["frames"]
+            data_check_dict_local["data_check"] = {}
+            # 创建场景目录
+            if lance_info["scenario"]:
+                scenario_dir = os.path.join(save_path_org, lance_info["scenario"][0])
+                self.save_path = scenario_dir
+
+                if self.common_cfg["algrithms_switch"]["qcnet"]:
+                    self.qcnet_parser.save_path = Path(self.save_path)
+
+            data_fetcher_local = get_data_fetcher(lance_info["lance_stage_one"])
+            simple_parser_success, frame_dict = self.load_lance(
+                data_fetcher_local,
+                lance_info["Dat名"],
+                lance_info["code_version"],
+                lance_info["lance_stage_one"],
+                lance_info["lance_sensor"],
+                lance_info["frames"],
+                scenario=data_check_dict_local,
+                is_test_data=is_test_data,
+            )
+            bucket_name = "cn--prod--veh-algo-plan-ctrl--label"
+            package_lance = PncLancePackage(bucket_name, self.save_path)
+            package_label_path = os.path.join(self.save_path, "package_label.json")
+            package_success, package_lance_path = package_lance.package_lance_ontime(
+                data_check_dict_local["Dat名"],
+                self.save_path,
+                package_label_path,
+                bucket_name,
+                frame_dict,
+                data_check_dict_local,
+                data_check_dict_local["版本号"],
+                delete_middel_lance=True,
+            )
+
+            # 写入JSON文件
+            os.makedirs(os.path.dirname(self.save_path + "/data_check/"), exist_ok=True)
+            save_json_file_path = (
+                self.save_path
+                + "/data_check/"
+                + data_check_dict_local["版本号"]
+                + "/"
+                + data_check_dict_local["Dat名"]
+                + ".json"
+            )
+            os.makedirs(os.path.dirname(save_json_file_path), exist_ok=True)
+            with open(save_json_file_path, "w", encoding="utf-8") as f:
+                json.dump(data_check_dict_local, f, indent=4, ensure_ascii=False)
+
+            return lance_info["Dat名"], True
+        except Exception as e:
+            if "Dat名" in data_check_dict_local:
+                print(f"处理失败: {data_check_dict_local['Dat名']}, 错误: {str(e)}")
+                traceback.print_exc()
+                return data_check_dict_local["Dat名"], False
+            else:
+                return "Null DatName", False
+
+    def load_and_process_input(self, input_source):
+        """统一入口：加载并处理来自不同来源的输入数据"""
+        input_data = {}
+        is_test_data = True  # 默认值
+        mode = 0
+
+        if isinstance(input_source, (str, Path)):
+            path = Path(input_source)
+
+            if path.is_file():
+                is_test_data = "test" in str(path).lower()
+                if path.suffix == ".csv":
+                    mode = 1
+                    input_data = self.parse_input_from_csv(str(path))
+                elif path.suffix == ".json":
+                    mode = 2
+                    input_data = self.parse_input_from_local_json(str(path))
+                elif path.suffix == ".xlsx":
+                    mode = 1
+                    is_test_data = False
+                    data = self.parse_input_from_xlsx(str(path))
+                    input_data.update(data)
+
+            elif path.is_dir():
+                for root, _, files in os.walk(path):
+                    for file_name in files:
+                        file_path = Path(root) / file_name
+                        if file_path.suffix == ".csv":
+                            mode = 1
+                            is_test_data = "test" in str(file_path).lower()
+                            data = self.parse_input_from_csv(str(file_path))
+                            input_data.update(data)
+                        if file_path.suffix == ".json":
+                            mode = 2
+                            is_test_data = "test" in str(file_path).lower()
+                            data = self.parse_input_from_local_json(str(file_path))
+                            input_data.update(data)
+
+        elif isinstance(input_source, list):
+            mode = 3
+            input_data = self.parse_input_from_s3_label_files(input_source)
+        else:
+            raise ValueError(f"不支持的 input_source 类型: {type(input_source)}")
+
+        if self.max_workers > 1:
+            self._init_shared_state()
+        total = len(input_data)
+        print(f"开始处理，共有{total}个DAT \n")
+        save_path_org = self.qcnet_parser.save_path
+        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {
+                executor.submit(
+                    self.process_single_dat, data, is_test_data, save_path_org, total
+                ): data
+                for _, data in input_data.items()
+            }
+            with tqdm(total=total, desc="deal with dat", unit="dat") as pbar:
+                for future in as_completed(futures):
+                    dat_name, success = future.result()
+                    pbar.update(1)
+                    remaining = total - pbar.n
+                    print(
+                        f"Processing datasets (processed: {pbar.n}, remaining: {remaining}) cur dat is {dat_name}"
+                    )
+
+        if not (self.common_cfg["use_dag"] and mode in [1, 3]):
+            save_path = lance_parser.save_path
+            halo_record_path = f"{save_path}/halo_dat_index"
+            if os.path.exists(halo_record_path):
+                shutil.rmtree(halo_record_path)
+            os.makedirs(halo_record_path, exist_ok=False)
+            for dir_path in Path(save_path).rglob("data_check"):
+                data_check_statistics_scenario(dir_path.parent, halo_record_path)
+
+
+if __name__ == "__main__":
+    with open("configs/common.yml", "r", encoding="utf-8") as f:
+        common_cfg = yaml.safe_load(f)
+        lance_parser = LanceParser(common_cfg)
+        """
+        使用说明：
+        1. lance_parser根据input_path的类型自动判断运行模式
+        2. 原mode1输入为不带场景标签的lance数据, 文件类型为csv, 格式lance_input/mode1路径中的csv文件, input_path可以是单个csv文件或包含csv文件的文件夹
+        3. 原mode2输入为带场景标签的lance数据, 文件类型为json, 格式比如lance_input/mode2路径中的json文件, input_path可以是单个json文件或包含json文件的文件夹
+        4. 原mode3输入为打包平台的s3地址的list
+        5. 可支持输入生产平台的直接产物xlsx文件,input_path是单个xlsx文件的路径,此模式需要适配镜像v1.5_py310_lance及以上版本
+        """
+        # input_path = (
+        #     "/root/tencent/liuyidi/lance-1219/data-dat_to_sample/lance_path.csv"
+        # )
+        # input_path = (
+        #     "/data/data-dat_to_sample/debug_input/mode2/train/intersection.json"
+        # )
+        # input_path = (
+        #     "/workspace/lyd/lance-1219/data-dat_to_sample/_2026-03-16_11_42_37_18979-.xlsx"
+        # )
+        input_path = [
+            "s3://cn--prod--e2e--res/e2e/data_pack/PNC_LCL_0310_a0d40dc4-a07a-4ead-980a-358360e7113d/label.json"
+        ]
+        lance_parser.load_and_process_input(input_path)
+        if common_cfg["visualizer"]["open_vis"]:
+            visualizer = Visualizer(common_cfg)
+            visualizer.vis(lance_parser.save_path)
