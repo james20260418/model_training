@@ -3,7 +3,7 @@
 """
 import copy
 import math
-from lance_utils import lerp_snapshots, _lerp_angle
+from down_sample import lerp_snapshots, _lerp_angle
 
 
 def make_dummy_frame(
